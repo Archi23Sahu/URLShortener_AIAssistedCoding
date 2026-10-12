@@ -2,13 +2,14 @@
 
 > **Author:** Archi Sahu
 > **Timeline:** 3 days
-> **Stack:** .NET 8, ASP.NET Core Web API, EF Core 8, SQL Server 2022, Redis 7, Docker, Serilog, GitHub Actions, xUnit, Moq, FluentAssertions
+> **Stack:** .NET 8, ASP.NET Core Web API, Swagger/OpenAPI, EF Core 8, SQL Server 2022, Redis 7, FluentValidation, Polly, Serilog, prometheus-net, Docker, GitHub Actions, xUnit, Moq, FluentAssertions
 
 ---
 
 ## Table of Contents
 
 1. [Overview](#1-overview)
+   - [Assessment coverage](#11-assessment-coverage)
 2. [Quick Start](#2-quick-start)
 3. [Architecture](#3-architecture)
 4. [API Reference](#4-api-reference)
@@ -28,9 +29,9 @@
 
 ## 1. Overview
 
-This is a URL shortener service built with .NET 8 and ASP.NET Core. It turns long URLs into short 6-character codes, redirects visitors to the original address, and records anonymous click analytics (clicks, unique visitors, countries, browsers, daily trends). It is intended as a production-style backend: a relational schema with deliberate indexes, optimistic locking, a Redis cache on the redirect path, per-client rate limiting, a cleanup job for expired links, and click recording that never slows a redirect down.
+This is a URL shortener service built with .NET 8 and ASP.NET Core. It turns long URLs into short 6-character codes, redirects visitors to the original address, and records anonymous click analytics (clicks, unique visitors, countries, browsers, daily trends). It is intended as a production-style backend: a relational schema with deliberate indexes, optimistic locking, a Redis cache on the redirect path, per-client rate limiting, a cleanup job for expired links, retries on transient database failures, Prometheus metrics, and click recording that never slows a redirect down.
 
-The goal of the project is to demonstrate engineer-led, AI-assisted development rather than blind code generation. AI produced first drafts of the schema, API, persistence, cache, analytics, rate limiting, cleanup and reporting code; I reviewed each against the requirements, ran and tested it, and recorded the decisions, the bugs I caught and the trade-offs I accepted (see [section 7](#7-ai-collaboration-log)).
+The goal of the project is to demonstrate engineer-led, AI-assisted development rather than blind code generation. AI produced first drafts of the schema, API, persistence, cache, analytics, rate limiting, cleanup, reporting, retry and metrics code; I reviewed each against the requirements, ran and tested it, and recorded the decisions, the bugs I caught and the trade-offs I accepted (see [section 7](#7-ai-collaboration-log)).
 
 **Implemented**
 
@@ -46,11 +47,33 @@ The goal of the project is to demonstrate engineer-led, AI-assisted development 
 - Global exception handling with RFC 7807 problem responses, input validation (FluentValidation), health check, Swagger
 - Structured logging with Serilog (message templates with named properties; levels and output format set in `appsettings.json`)
 - GitHub Actions pipeline (`.github/workflows/ci.yml`): restore, build, unit and integration tests against a SQL Server service container, coverage upload, and a Docker image build
+- Polly retry policies on idempotent database operations (reads, reports, deletes); inserts and optimistic-lock saves are never retried
+- Metrics at `/metrics` (Prometheus format): HTTP request counts and latency, links created, cache hits and misses, click queue depth, clicks stored and dropped, database retries, expired links deleted
 
-**Planned (not built)**
+**Not built**
 
-- Polly retry policies, metrics and monitoring (the health check is the only monitoring today)
-- See [section 15](#15-what-i-would-build-next)
+- Kafka / Azure Service Bus and Azure deployment (optional in the assessment); see [section 15](#15-what-i-would-build-next)
+
+### 1.1 Assessment Coverage
+
+| Assessment requirement | Status | Where |
+|---|---|---|
+| POST `/api/v1/shorten`, GET `/{code}` (302), GET `/api/v1/analytics/{code}`, PUT and DELETE `/api/v1/shorten/{code}` | Done | [Section 4](#4-api-reference) |
+| Duplicate URL detection, configurable expiration | Done | [Section 5](#5-database-schema), [Section 2 configuration](#configuration) |
+| Redis caching | Done | [Section 3](#3-architecture), Entry 6 |
+| Rate limiting middleware | Done | [Section 9](#9-scenario-2-brownfield) |
+| Global exception handling, FluentValidation, health checks, Swagger | Done | [Section 4](#4-api-reference) |
+| Structured logging (Serilog) | Done | Entry 10 |
+| Background job: expired link cleanup | Done | [Section 3](#rate-limiting-and-cleanup) |
+| Retry policies (Polly) | Done (idempotent database operations only) | Entry 11, `ResilientShortUrlRepository` |
+| Metrics and monitoring | Done (`/metrics`, Prometheus format, plus `/health`) | Entry 11, `AppMetrics` |
+| Unit, integration, performance and security tests | Done | [Section 11](#11-testing--validation) |
+| Docker, docker-compose | Done | [Section 2](#2-quick-start) |
+| CI/CD (GitHub Actions) | Done (build, test, image; no deploy) | `.github/workflows/ci.yml` |
+| Architecture diagram, ER diagram | Done | `docs/` |
+| Scenarios 1, 2 and 3 | Done | Sections 8 to 10 |
+| AI collaboration log, trade-offs, limitations, lessons learned | Done | Sections 7, 12, 13, 14 |
+| Kafka / Azure Service Bus, Azure deployment (optional) | Not built | Async analytics uses an in-process queue ([Section 12](#12-design-decisions--trade-offs)) |
 
 ---
 
@@ -74,8 +97,15 @@ docker compose up --build
 | API          | http://localhost:8080          |
 | Swagger UI   | http://localhost:8080/swagger  |
 | Health check | http://localhost:8080/health   |
+| Metrics      | http://localhost:8080/metrics  |
 
 The compose file starts SQL Server, Redis and the API. The API waits for both to report healthy, and applies the EF Core migrations on startup (`Database__MigrateOnStartup=true`). `docker compose up --build` was run end to end: health check, create, redirect, analytics and browser report all worked.
+
+To see the metrics once the API has served a few requests:
+
+```bash
+curl -s http://localhost:8080/metrics | grep urlshortener_
+```
 
 If ports 1433 or 6379 are already in use (for example by containers started with `docker run`), stop those first.
 
@@ -84,7 +114,7 @@ If ports 1433 or 6379 are already in use (for example by containers started with
 Start only the dependencies, then run the API from your IDE or the CLI.
 
 ```bash
-docker run -d --name urlshortener-sql -p 1433:1433 -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD=Your_URLShortener_Passw0rd! mcr.microsoft.com/mssql/server:2022-latest
+docker run -d --name urlshortener-sql -p 1433:1433 -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD=Your_strong_Passw0rd! mcr.microsoft.com/mssql/server:2022-latest
 docker run -d --name urlshortener-redis -p 6379:6379 redis:7-alpine
 dotnet ef database update --project src
 dotnet run --project src
@@ -131,6 +161,8 @@ dotnet run --project tests/PerformanceTests -c Release -- https://localhost:7037
 | `RateLimit:Read:PermitLimit` / `WindowSeconds` | Redirect and analytics requests per client IP per window | `300` / `60` |
 | `Cleanup:Enabled`              | Run the expired-link cleanup job | `true` |
 | `Cleanup:IntervalMinutes` / `GracePeriodDays` / `BatchSize` | How often it runs, how long after expiry a link is kept, rows deleted per batch | `60` / `7` / `1000` |
+| `Resilience:Enabled`           | Retry transient database failures on idempotent operations | `true` |
+| `Resilience:MaxRetryAttempts` / `BaseDelayMilliseconds` | Retries after the first try, and the first delay (doubles each retry, with jitter) | `3` / `100` |
 | `Database:MigrateOnStartup`    | Apply migrations when the API starts | `false` (`true` in compose) |
 | `Serilog:MinimumLevel`         | Log levels, with per-namespace overrides (for example `UrlShortener.Caching.CachedUrlShortenerService` at `Debug` shows cache hits and misses) | `Information` |
 
@@ -138,15 +170,20 @@ dotnet run --project tests/PerformanceTests -c Release -- https://localhost:7037
 
 ## 3. Architecture
 
-### Component diagram (docs/Architecture diagram.png)
+### Component diagram
+
+![Architecture diagram](docs/Architecture%20diagram.png)
+
+Diagram source: [docs/architecture.mmd](docs/architecture.mmd) (Mermaid).
 
 1. Front door: every request passes the exception-handling middleware (consistent RFC 7807 errors, no internals leaked) and then the rate limiter (per client IP: 20 writes and 300 reads per minute, otherwise 429). /health and Swagger are not limited.
 2. Controllers: ShortenController creates, updates and deletes links (input checked first), RedirectController redirects, and AnalyticsController serves statistics.
-3. Lookup layer: CachedUrlShortenerService checks Redis first and falls back to UrlShortenerService, which holds the business rules. Only ShortUrlRepository talks to SQL Server.
+3. Lookup layer: CachedUrlShortenerService checks Redis first and falls back to UrlShortenerService, which holds the business rules. A Polly retry decorator (ResilientShortUrlRepository) wraps ShortUrlRepository, the only class that talks to SQL Server, and retries transient SQL errors on idempotent operations only.
 4. Clicks: a redirect only places a record in a bounded in-memory queue. A background service saves queued clicks to the database in batches, so redirects never wait for the database. Analytics can trail a click by about 2 seconds.
 5. Reports: ReportService returns daily, country and browser breakdowns, aggregated in SQL.
 6. Cleanup: an hourly job deletes links that expired more than 7 days ago, in batches.
-7. Design idea: keep the redirect path fast, do slow work in the background, and keep all database access in one repository.
+7. Metrics: HTTP request metrics and the application counters in AppMetrics are served at /metrics (Prometheus format, not rate limited).
+8. Design idea: keep the redirect path fast, do slow work in the background, and keep all database access in one repository.
 
 
 ### Redirect request flow
@@ -169,11 +206,11 @@ Every request to the shorten, redirect and analytics endpoints passes the built-
 ### Project structure
 
 ```
-URLShortenerProject/
+UrlShortener/
 ├── src/
 │   ├── Controllers/
 │   ├── Services/            (URL service, Base62, normalizer)
-│   ├── Repositories/        (DbContext, repository, migration helper)
+│   ├── Repositories/        (DbContext, repository, Polly retry decorator, migration helper)
 │   ├── Entities/
 │   ├── DTOs/
 │   ├── Middleware/
@@ -181,6 +218,7 @@ URLShortenerProject/
 │   ├── Analytics/           (click queue, tracker, visitor hash, country resolver, browser detector)
 │   ├── RateLimiting/
 │   ├── Caching/             (Redis cache decorator, circuit breaker)
+│   ├── Metrics/             (Prometheus counters and gauges)
 │   ├── BackgroundServices/  (click recorder, expired-link cleanup)
 │   ├── Validators/
 │   └── Exceptions/
@@ -190,7 +228,7 @@ URLShortenerProject/
 │   └── PerformanceTests/    (console load tool)
 ├── .github/workflows/       (CI pipeline)
 ├── docker/
-├── docs/                    (ER diagram, SQL schema script)
+├── docs/                    (architecture and ER diagrams, SQL schema and migration scripts)
 ├── docker-compose.yml
 └── README.md
 ```
@@ -210,6 +248,7 @@ URLShortenerProject/
 | PUT    | `/api/v1/shorten/{code}`                       | Change the target URL and optionally reset expiry                            | 200       | 400, 404, 409, 410, 429 |
 | DELETE | `/api/v1/shorten/{code}`                       | Delete a short URL and its click history                                     | 204       | 404, 429      |
 | GET    | `/health`                                      | Health check (includes the database)                                         | 200       | 503           |
+| GET    | `/metrics`                                     | Prometheus metrics                                                           | 200       |               |
 
 Rate limits (per client IP, per minute): 20 for create, update and delete together, 300 for redirects and analytics. Over the limit the API returns `429` with a `Retry-After` header. `/health` is not limited.
 
@@ -227,11 +266,11 @@ Content-Type: application/json
 ```json
 {
   "shortUrl": "http://localhost:8080/100001",
-  "expiresAt": "2026-11-08T17:20:11.4Z"
+  "expiresAt": "2026-11-08"
 }
 ```
 
-`expiryDays` is optional (default 30, maximum 365).
+`expiryDays` is optional (default 30, maximum 365). `expiresAt` is a UTC calendar date, as in the assessment contract; the exact expiry instant is kept and enforced by the service, so the link stops working at that time of day on the date shown.
 
 ### Example: update
 
@@ -290,9 +329,9 @@ Validation failures (400) add an `errors` object keyed by field name.
 
 The full script is in [`docs/schema.sql`](docs/schema.sql).
 
-### ER diagram 
+### ER diagram
 
-docs/ER diagram.png
+![ER diagram](docs/ER%20Diagram.png)
 
 
 ### Keys and indexes, and why
@@ -335,7 +374,7 @@ AI drafts documentation
    ↓
 Engineer reviews for accuracy
    ↓
-Commit
+Commit (one per scenario)
 ```
 
 **Principles I followed**
@@ -357,7 +396,9 @@ Commit
 | Solution Design | Proposed the schema, indexes, Base62 scheme, cache and analytics designs | Reviewed keys, indexes and trade-offs, picked the options (Base62 over GUID, async analytics, fail-open cache) |
 | Implementation | Generated controllers, DTOs, validators, EF Core mappings, repository, services, middleware, cache decorator, background worker | Applied the code to my project, built and ran it, fixed integration issues, tested behaviour manually |
 | Testing | Generated xUnit tests (encoder, normalizer, validators, service, cache, analytics) | Ran them, fixed failures, reviewed what is and is not covered |
-| Documentation | Drafted README, ER diagram, schema script | Checked against the running system |
+| Delivery | Wired Serilog and the GitHub Actions pipeline (Entry 10) | Checked the log output, fixed a stale logging namespace, matched CI to the compose setup |
+| Resilience and monitoring | Proposed a Polly retry decorator, Prometheus metrics and the tests for both (Entry 11) | Limited retries to idempotent operations, kept Redis on its circuit breaker, wrote the scope down, reviewed the tests |
+| Documentation | Drafted README, ER diagram, schema script; reviewed the README against the assessment | Checked against the running system, fixed missing files and stale figures |
 
 ### 7.2 Detailed prompt log
 
@@ -377,19 +418,39 @@ Accepted / Modified / Rejected
 Validation (build, tests, manual check)
 ```
 
-Example from this project (Entry 6): the requirement was a Redis cache with invalidation; the prompt asked for the steps and then the code; the AI proposed a cache-aside decorator with a TTL and a circuit breaker; my review covered TTL, invalidation and Redis failure; I accepted it; and I validated it by watching cache hit and miss log lines, updating and deleting a link, and stopping Redis.
+Worked example (Entry 6):
+
+| Step | What happened |
+|---|---|
+| Requirement | Serve repeat redirects from Redis, keep entries correct after update and delete, keep redirects working if Redis is down |
+| Prompt | Asked for the steps first, then for the code |
+| AI proposal | Cache-aside decorator with a TTL and a circuit breaker |
+| Human review | TTL, invalidation, behaviour when Redis fails |
+| Decision | Accepted |
+| Validation | Cache hit and miss log lines, update and delete a link, stop Redis |
+
+**About the prompts below.** They are summaries of what I asked, not verbatim transcripts; short quoted fragments are exact. I have kept them honest on purpose, including the vague ones, because the second half of the log shows what a weak prompt cost me.
+
+**Prompt structure I moved towards.** The later entries (6, 7, 11) work better than the early ones because each prompt had the same five parts:
+
+1. **Context:** what already exists and where (project layout, namespaces, shell).
+2. **Goal:** the outcome and why it matters (for example "redirects must stay fast").
+3. **Constraints:** what must not change or break (the redirect path, existing tests, no new infrastructure).
+4. **Output asked for:** steps and options with trade-offs first, code second.
+5. **Proof required:** which build, test or manual check shows it works.
 
 Entry format used for every interaction:
 
 ```
 #### Entry N: <short title>
+- Phase
+- Task
 - Prompt (summary or key excerpt)
 - What AI produced
 - My review
 - Decision: Accepted | Modified | Rejected
 - What I changed and why
 - Validation
-
 ```
 
 #### Entry 1: Requirement analysis
@@ -424,14 +485,14 @@ Entry format used for every interaction:
 - **My review:** Naming: versioned `/api/v1/...`, short code on the root for redirects. Standards: 201 for create (200 when the URL already exists), 302 for redirects, 204 for delete. Errors: one RFC 7807 format with a `traceId`, validation failures grouped by field, no internals on 500.
 - **Decision:** Modified
 - **What I changed and why:** Fixed a route template that crashed the app at startup (see 7.3 #1), and turned off MVC's implicit `[Required]` on non-nullable strings so every 400 comes from FluentValidation in one format. Replaced my own `AnalyticsResponse` class with the shared DTO.
-- **Validation:** `POST /api/v1/shorten` returned 201 with code `100001`. Create, redirect, update, delete, analytics and the 400, 404 and 410 cases are now covered by the integration suite against real SQL Server (85 tests).
+- **Validation:** `POST /api/v1/shorten` returned 201 with code `100001`. Create, redirect, update, delete, analytics and the 400, 404 and 410 cases are now covered by the integration suite against real SQL Server (85 tests when this entry was written, 89 now).
 
 
 #### Entry 4: Shortening algorithm
 
 - **Phase:** Design / Implementation
 - **Task:** Choose and implement the code generation approach
-- **Prompt (summary or key excerpt):** Asked for implementation options for generating short codes.
+- **Prompt (summary or key excerpt):** Asked for implementation options for generating short codes, with the trade-offs of each (length, collision risk, predictability, cost), so that I could choose rather than receive a single answer. The assessment asks for a choice of Base62 over GUID/UUID to keep URLs shorter.
 - **What AI produced:** Four options, compared below, and a Base62 encoder over the database id.
 - **My review:** Compared length, collision risk, predictability and cost.
 - **Decision:** Base62 over GUID/UUID, to keep URLs short (as required).
@@ -452,7 +513,7 @@ The cost I accepted: codes are guessable in sequence, so anyone can enumerate li
 
 - **Phase:** Implementation
 - **Task:** EF Core entities and repository
-- **Prompt (summary or key excerpt):** Part of the build request above.
+- **Prompt (summary or key excerpt):** Covered by the same build request as Entry 3 ("EF Core persistence"). My review points came from the assessment's Task 4 (transactions, concurrency handling, optimistic locking), not from the prompt, which is why the review below is longer than the prompt.
 - **What AI produced:** `IShortUrlRepository` / `ShortUrlRepository`, an insert that runs in a transaction, optimistic locking with `RowVersion`, a delete using `ExecuteDeleteAsync`, and a migration helper that retries until the database is ready.
 - **My review:**
   - Transactions: the code is derived from the identity id, which is only known after the insert. The insert stores a unique placeholder code, saves to get the id, writes the real code, and commits, all in one transaction so a failure leaves no row with a placeholder.
@@ -495,7 +556,7 @@ The cost I accepted: codes are guessable in sequence, so anyone can enumerate li
 
 - **Phase:** Testing
 - **Task:** Unit and integration tests
-- **Prompt (summary or key excerpt):** Generate tests alongside each feature.
+- **Prompt (summary or key excerpt):** Asked for xUnit, Moq and FluentAssertions tests for each feature as it was built. After reviewing the results I asked for a second pass: integration tests against real SQL Server, security tests, and a load tool. The first prompt named no scenarios, so the AI wrote mostly happy-path tests; the second named the gaps and got better output.
 - **What AI produced:** Unit tests for the Base62 encoder, short-code generator, URL normalizer, validators, URL service, cache decorator and analytics components.
 - **My review:** Ran the suite and fixed failures (see 7.3). Gaps I found: every service test mocked the repository, so nothing exercised SQL Server, EF Core mappings, the middleware or the routes; the optimistic-lock conflict could only be tested against a mock; the pipeline (rate limiting, validation, error format) had no coverage at all.
 - **Decision:** Modified. Kept the generated unit tests and asked for integration, security and load tests on top.
@@ -507,8 +568,8 @@ The cost I accepted: codes are guessable in sequence, so anyone can enumerate li
 
 - **Phase:** Docs
 - **Task:** README and architecture docs
-- **Prompt (summary or key excerpt):** Asked AI to help complete the README from the template.
-- **What AI produced:** This README, the ER diagram and the SQL script.
+- **Prompt (summary or key excerpt):** Asked AI to help complete the README from the template. Later gave it the assessment PDF and asked for a review of the README against it, with the instruction to change anything that did not match.
+- **What AI produced:** This README, the ER diagram and the SQL script; then, from the review, embedded diagrams, a missing migration script, corrected commit references and an assessment coverage table (section 1.1).
 - **My review:** Checked each section against the running system. Corrections: the README still described rate limiting and cleanup as planned; the Docker Quick Start failed on my machine until a missing `docker/Dockerfile` and a `.dockerignore` were added (see 7.3 #10 and #11); the performance section had to report the failed connections of the 1000-concurrent run instead of a clean number.
 - **Decision:** Modified
 - **What I changed and why:** Updated capabilities, API table, configuration, diagram, scenarios, limitations and test results to match what was actually built and measured.
@@ -524,6 +585,47 @@ The cost I accepted: codes are guessable in sequence, so anyone can enumerate li
 - **Decision:** Modified
 - **What I changed and why:** Removed the old `Logging` section so there is one source of log configuration. The workflow uses the same SQL Server image and password as `docker-compose.yml` and the integration-test defaults, so no secrets or overrides are needed in CI.
 - **Validation:** Ran the API after the change: the console shows the Serilog format (for example `[18:11:06 DBG] UrlShortener.Caching.CachedUrlShortenerService: Cache miss for 10000G` and `[18:11:07 WRN] UrlShortener.Middleware.ExceptionHandlingMiddleware: Request failed with 410: The short URL '10000G' has expired.`). The cache Debug lines work again after the namespace fix (`Cache miss` then `Cache hit` for the same code). `dotnet test`: 266 passed, 0 failed (181 unit, 85 integration).
+
+#### Entry 11: Polly retries and metrics
+
+- **Phase:** Implementation
+- **Task:** Close the two reliability items the assessment lists that were still missing (Polly retry policies, metrics and monitoring)
+- **Prompt (summary or key excerpt):** After the README review showed two reliability features from the assessment were missing, I asked for the code changes to close them (Polly retry policies, metrics and monitoring). I then asked whether new tests were needed, and had the AI list the gaps before it wrote any (it named five); finally I asked for the architecture diagram to be updated. Asking for the list first let me approve the scope.
+- **What AI produced:** `ResilientShortUrlRepository` (a Polly v8 retry pipeline wrapped around the repository), `ResilienceOptions`, `AppMetrics` (prometheus-net counters and a queue-depth gauge), `/metrics` and HTTP metrics middleware, unit tests for the retry rules and the metric counters, and integration tests for `/metrics`.
+- **My review:**
+  - Polly: retries are only safe on idempotent operations. I limited them to reads, report queries and set-based deletes. `AddAsync` (transaction plus placeholder code) and `SaveChangesAsync` (tracked entity, optimistic lock) are deliberately not retried, because a blind retry could create a duplicate row or hide a 409.
+  - Only transient SQL error numbers are retried (timeout, deadlock victim, Azure SQL busy and throttling codes), with exponential backoff and jitter, three retries by default.
+  - This replaces my earlier decision in Entry 10 not to add Polly: wrapping only the idempotent calls gives a clear failure mode to protect against, which was my objection before.
+  - Metrics: counters are static and incremented with no I/O on the hot path. Queue depth is read when `/metrics` is scraped, not on every click.
+  - Redis is not wrapped in Polly: the circuit breaker from Entry 6 already covers it, and a retry there would slow redirects.
+- **Decision:** Modified (scope limited as above)
+- **What I changed and why:** Registered the concrete repository and the decorator by hand in `Program.cs` so the pipeline is a singleton. `/metrics` is not rate limited (it carries no rate-limit attribute) and exposes no per-link data.
+- **Validation:** `dotnet test tests/UnitTests`: 214 passed (181 existing, 30 for retries and metrics, 3 for the date response format). The new tests cover: retry then success, giving up after the maximum, no retry for non-transient errors, no retry for add or save, the disabled switch, argument forwarding and retry for every retried method, the real SQL error-number list using reflection-built `SqlException` objects, and that each metric counter really increments (compared before and after, because the counters are static and shared between parallel tests). Started the API and confirmed `/metrics` returns the `urlshortener_*` series. Five integration tests were added in `MetricsEndpointTests.cs` (series present, cache hit and miss after a redirect, no short code in the output, decorator resolved from DI, resilience disabled, `/metrics` never rate limited). Full `dotnet test` run against SQL Server in Docker: 303 passed, 0 failed (214 unit, 89 integration).
+
+#### Prompt patterns: what worked and what did not
+
+| Pattern | Seen in | Result |
+|---|---|---|
+| "Build X" with no layout, namespaces or commands | Entries 3 and 5 | Code that had never been compiled: missing usings, a crashing route template, assumed setup (7.3 #1 to #6) |
+| Asking for options with trade-offs before code | Entry 4 | The decision was mine and is documented (options table) |
+| Asking for steps first, then code | Entries 6 and 7 | Reviewable output; my review points were already in the plan |
+| Stating the failure mode in the goal ("keep redirects working if Redis is down") | Entry 6 | The circuit breaker and the failure tests came from the prompt, not from my later review |
+| Asking for "tests" without naming scenarios | Entry 8 | Happy-path unit tests; the SQL, middleware and pipeline gaps were mine to find |
+| Asking the AI to list the gaps before writing anything | Entry 11 | Scope agreed first, no unwanted code |
+| Asking it to check the work against the assessment document | Entry 9 | Found missing files, stale commit references and two unbuilt features |
+
+Next time I would give every prompt the five parts listed at the top of this section, and ask for the verification command with the code.
+
+#### Entry 12: Final validation against the assessment
+
+- **Phase:** Validation
+- **Task:** Check every file and the delivered behaviour against the assessment before submitting
+- **Prompt (summary or key excerpt):** Asked for a final validation of each file against the assessment requirements and for the changes needed. Then asked for the contract details I had left as judgement calls to follow the assessment document.
+- **What AI produced:** A checklist of requirement against file, four findings (listed in 7.3 #14 to #17), and the change to return `expiresAt` as a UTC date.
+- **My review:** The findings were real defects, not wording: with the compose setup the rate limiter was off, and the local-run command could not connect to the database. For the response contract, the assessment shows `"expiresAt": "2027-01-01"`, so I accepted the date format and kept the exact expiry instant inside the service. For `countries` the assessment example mixes a code (`US`) with a name (`India`), so no single rule matches it; I kept ISO codes.
+- **Decision:** Accepted, with the country keys left as codes
+- **What I changed and why:** Rate limiting is on by default in `appsettings.json` (tests set their own value). The README local-run password matches `appsettings.json`. The empty placeholder test was removed. The load-test project is part of the solution. `expiresAt` is serialized by a small converter, so the service and its tests still use the full timestamp.
+- **Validation:** Release build with 0 warnings; unit tests 214 passed; links in the README resolve. The integration suite and `docker compose up --build` must be re-run after these changes: the earlier compose run (Entry 9) was made with rate limiting off.
 
 ### 7.3 Bugs or risks AI introduced that I caught
 
@@ -542,6 +644,10 @@ The cost I accepted: codes are guessable in sequence, so anyone can enumerate li
 | 11 | The `docker/Dockerfile` the compose file references was missing from my project folder, and ports 1433/6379 were already used by my earlier containers | `docker compose up` errors | Added the Dockerfile; stopped the old containers before the compose run |
 | 12 | My cleanup test showed an expired link still redirecting: the code was fine, but my manual SQL delete bypassed cache invalidation and Redis still held the entry | Compared Redis and SQL | Cleared the key and re-tested; documented as a trade-off (the TTL bounds staleness) |
 | 13 | The first 1000-concurrent load run lost 121 requests to connection errors, so the headline latency was meaningless | Console output and Redis counters did not add up (879 lookups for 1000 requests) | Reported it as it was, explained the cause, and added lower-concurrency runs |
+| 14 | `appsettings.json` had `RateLimit:Enabled: false` while the code default and the README said `true`; `docker compose` does not override it, so the container never returned 429 | Final validation against the assessment: compared configuration files with the README | Set it to `true`; tests keep their own explicit value |
+| 15 | The local-run `docker run` command in the README used a different SQL password from `appsettings.json`, so the API could not connect | Compared the README commands with the configuration | Corrected the README password |
+| 16 | An empty template test (`UnitTest1.Test1`) was counted as a passing integration test | Listed the discovered tests | Deleted it; the test totals in the README were reduced by one |
+| 17 | The load-test project was not part of the solution, so CI never built it | Read the solution file against the README structure | Added it to `UrlShortener.slnx` |
 
 ---
 
@@ -562,17 +668,18 @@ The cost I accepted: codes are guessable in sequence, so anyone can enumerate li
 
 ### Validation
 
-- Unit tests: 181 passed, 0 failed
-- Integration tests: 85 passed, 0 failed (includes the security tests)
+- Unit tests: 214 passed, 0 failed
+- Integration tests: 89 passed, 0 failed (includes the security tests and the five metrics and resilience tests)
+- Full run: 303 passed, 0 failed
 - Performance test: see [section 11](#performance-results)
 
-**Deliverable:** Working URL shortener service, run with `docker compose up --build` (single final commit).
+**Deliverable:** Working URL shortener service, run with `docker compose up --build` (commit `574547f`, "Scenario 1: Greenfield Development").
 
 ---
 
 ## 9. Scenario 2: Brownfield
 
-**Existing system:** the Scenario 1 service (create, redirect, update, delete, Redis cache, click analytics, health check). Caching and analytics were built as Scenario 1 Tasks 5 and 6, so the enhancements applied to the running system in this scenario are **rate limiting** and **expiry cleanup**. The full analysis is in [`docs/Scenario2-Impact-Analysis.md`](docs/Scenario2-Impact-Analysis.md).
+**Existing system:** the Scenario 1 service (create, redirect, update, delete, Redis cache, click analytics, health check). Caching and analytics were built as Scenario 1 Tasks 5 and 6, so the enhancements applied to the running system in this scenario are **rate limiting** and **expiry cleanup**. The analysis is below.
 
 **Enhancement request:** add analytics, expiration, Redis caching, and rate limiting.
 
@@ -607,16 +714,29 @@ Engineer review
 
 | Enhancement | Commit | AI contribution | My review and changes |
 |---|---|---|---|
-| Expiration (cleanup of long-expired links) | Single final commit | `ExpiredLinkCleaner`, `ExpiredLinkCleanupService` (timer, own scope per pass), `DeleteExpiredAsync`, options, unit tests | Chose a grace period so analytics survive a while after expiry. Manual test showed the link still redirecting after I deleted the row by hand: Redis still held the entry. Cause was my test (SQL edits bypass cache invalidation), not the code; recorded as a trade-off |
-| Redis caching | Single final commit | See Entry 6 (built in Scenario 1, Task 5) | See Entry 6 |
-| Analytics | Single final commit | See Entry 7 (built in Scenario 1, Task 6) | See Entry 7 |
-| Rate limiting | Single final commit | ASP.NET Core built-in rate limiter, fixed window per client IP, separate write and read policies, 429 handler with `Retry-After`, options, unit tests | Confirmed with a low limit (3) that writes beyond the limit returned 429; all writes (POST, PUT, DELETE) share one counter, which matches the design. Limits are read per request so tests can change them |
+| Expiration (cleanup of long-expired links) | `c804e35` | `ExpiredLinkCleaner`, `ExpiredLinkCleanupService` (timer, own scope per pass), `DeleteExpiredAsync`, options, unit tests | Chose a grace period so analytics survive a while after expiry. Manual test showed the link still redirecting after I deleted the row by hand: Redis still held the entry. Cause was my test (SQL edits bypass cache invalidation), not the code; recorded as a trade-off |
+| Redis caching | `574547f` (Scenario 1) | See Entry 6 (built in Scenario 1, Task 5) | See Entry 6 |
+| Analytics | `574547f` (Scenario 1) | See Entry 7 (built in Scenario 1, Task 6) | See Entry 7 |
+| Rate limiting | `c804e35` | ASP.NET Core built-in rate limiter, fixed window per client IP, separate write and read policies, 429 handler with `Retry-After`, options, unit tests | Confirmed with a low limit (3) that writes beyond the limit returned 429; all writes (POST, PUT, DELETE) share one counter, which matches the design. Limits are read per request so tests can change them |
+
+### Second enhancement: retries and metrics (Entry 11)
+
+Applied afterwards to the same running system, after reviewing the README against the assessment showed two reliability features missing. Same workflow: existing code, dependency analysis, impact analysis, implementation, tests, review.
+
+| Area | Impact found | Risk | Mitigation |
+|---|---|---|---|
+| Repository | New decorator over `IShortUrlRepository`; the DI registration in `Program.cs` changes. Services, controllers and tests that use the interface are untouched | Retrying a non-idempotent write could create a duplicate row or hide a 409 | Only reads, reports and set-based deletes are retried; `AddAsync` and `SaveChangesAsync` are not |
+| Click recorder | Uses its own `DbContext` and bypasses the repository, so it is not covered by the retry layer | A transient failure on a click batch is not retried as a whole | Existing fallback retries clicks one by one; listed under limitations |
+| Redirect path | One counter increment per request, no I/O | Extra work on the hot path | Static in-memory counters; queue depth is read at scrape time |
+| API contract | New `GET /metrics` endpoint; no change to existing endpoints | Public exposure of operational counts | No per-link data in the output; listed under limitations (restrict at network level) |
+| Configuration | New `Resilience:*` settings; retries can be switched off | Different behaviour between environments | Defaults documented in section 2 |
+| Tests | The existing 181 unit tests still pass unchanged; 30 unit and 5 integration tests added | Regression in the existing paths | Full suite re-run after the change: 303 passed (214 unit, 89 integration) |
 
 ### Deliverables
 
-- Updated architecture: see the diagram in [section 3](#3-architecture) (rate limiter and cleanup job added)
+- Updated architecture: see the diagram in [section 3](#3-architecture) (rate limiter, cleanup job, retry decorator and metrics added)
 - Database migration scripts: `InitialCreate` and `AddBrowserToClickEvents` (EF Core), with plain SQL in [`docs/schema.sql`](docs/schema.sql) and [`docs/migrations/AddBrowserToClickEvents.sql`](docs/migrations/AddBrowserToClickEvents.sql). Scenario 2 itself needed no migration
-- Regression test results: 181 unit and 85 integration tests pass (create, redirect, update, delete, analytics, health, 404, 410, 429 and the validation cases)
+- Regression test results: at the end of the rate limiting and cleanup work, 181 unit and 85 integration tests passed (create, redirect, update, delete, analytics, health, 404, 410, 429 and the validation cases). After the retry and metrics work the full suite passes: 303 tests (214 unit, 89 integration)
 
 ---
 
@@ -637,7 +757,7 @@ Engineer review
 - Should bots be counted or filtered?
 - What about clicks recorded before browser data existed?
 
-### Step 2: Product owner response (assumed)
+### Step 2: Product owner response
 
 | Question | Answer |
 |---|---|
@@ -645,13 +765,11 @@ Engineer review
 | Country analytics | Yes |
 | Browser analytics | Yes |
 | Export | Out of scope for this iteration (can be added later on top of the same queries) |
-| Time zone | UTC (assumed, to keep reports reproducible) |
+| Time zone | UTC (keeps reports reproducible) |
 | Range | Default last 30 days, maximum 366 days |
 | Unknown values | Shown, not hidden |
 | Bots | Counted and labelled "Bot" (not filtered) |
 | Old data | Clicks without browser data are reported as "Unknown" |
-
-The last five rows are my assumptions where the product owner did not answer; each is called out here so they can be changed.
 
 ### Step 3: Updated requirements
 
@@ -717,7 +835,7 @@ Browser families: Chrome, Edge, Firefox, Safari, Opera, Internet Explorer, Bot, 
 
 - **AI proposals I accepted:** nullable column plus a migration; a separate report service; a heuristic detector instead of a library; zero-filled days; an explicit `unknownClicks` count instead of dropping unknowns; a 366-day cap so one request cannot scan unbounded history.
 - **AI proposals I changed or rejected:** export (out of scope); a third-party User-Agent parsing package (rejected to avoid a dependency for a coarse breakdown, and the limits are documented: no versions, Samsung Internet falls under "Other"); filtering bots (kept them, labelled, so totals match the older `GET /api/v1/analytics/{code}` count). 
-- **Implementation commit:** single final commit
+- **Implementation commit:** `f02f5cd` ("Scenario 3: Ambiguous Requirement")
 - **Tests added:** `BrowserDetectorTests` (about 20 real User-Agent strings), `ReportServiceTests` (zero-filling, default range, range limits, not found, unknown values, percentages, bounds passed to the repository), `ClickTrackerBrowserTests`, and integration tests `ReportEndpointTests` against real SQL Server.
 - **Manual validation:** opened one link in Chrome, Edge and Firefox plus `curl`; sent `CF-IPCountry: IN` and `US`; the three endpoints returned the expected counts. `Browser` was stored per click (`Bot` for `curl`) and `Country` was `NULL` without the header. Called a report with a value that is not a date (`from=30`) and got 400.
 - **What I learned while testing:** the end of the range is a UTC midnight. Clicks recorded on the evening of one local day can fall on the next UTC day, so reports can look one day ahead of local time. This is a decision, listed in the trade-offs.
@@ -730,7 +848,7 @@ Browser families: Chrome, Edge, Firefox, Safari, Opera, Internet Explorer, Bot, 
 
 | Level | Scope | Tools |
 |---|---|---|
-| Unit | Base62 encoder, short-code generator, URL normalizer, validators, URL service, cache decorator, analytics (queue, hasher, tracker, country resolver, browser detector), report service, rate-limit policy, expired-link cleaner | xUnit, Moq, FluentAssertions |
+| Unit | Retry decorator (Polly), Base62 encoder, short-code generator, URL normalizer, validators, URL service, cache decorator, analytics (queue, hasher, tracker, country resolver, browser detector), report service, rate-limit policy, expired-link cleaner | xUnit, Moq, FluentAssertions |
 | Integration | Real application in memory (controllers, validation, middleware, EF Core) against real SQL Server in Docker; Redis replaced by an in-memory cache | xUnit, `WebApplicationFactory`, the compose SQL Server service |
 | Performance | 1000 requests against the redirect endpoint at 1000, 100 and 250 in flight, with rate limiting off | Small console load tool in `tests/PerformanceTests` (HttpClient, stopwatch percentiles), Redis `INFO stats` for the cache hit ratio |
 | Security | SQL injection, unsafe URL schemes, credentials in URLs, XSS strings, header injection, path traversal, oversized and malformed input, expired links, rate limiting | Automated tests (in `tests/IntegrationTests/SecurityTests.cs`) plus manual checks |
@@ -741,16 +859,17 @@ Run: `dotnet test` (all), `dotnet test tests/IntegrationTests` (needs SQL Server
 
 | Suite | Tests | Passed |
 |---|---|---|
-| Unit | 181 | 181 |
-| Integration (includes the security tests) | 85 | 85 |
+| Unit | 214 | 214 |
+| Integration (includes the security tests) | 89 | 89 |
+| **Total** | **303** | **303** |
 
-**Code coverage** (coverlet, unit and integration runs merged with ReportGenerator, `src` assembly only): **66.4% of lines** (927 of 1,395 coverable), **86% of branches** (167 of 194), **92.5% of methods**. The number is lower than the per-class picture suggests because three kinds of code are not exercised by the tests:
+> The test counts above are current (303 passed). The coverage figure below was re-measured after Entry 11. The performance figures below were measured before the retry decorator and the metrics middleware were added (Entry 11) and have not been re-run.
 
-- EF Core generated migrations (`InitialCreate`, `AddBrowserToClickEvents`, the model snapshot): 0%. They were verified by applying them to SQL Server, including through `docker compose up --build`.
-- `DatabaseInitializer` (the migrate-on-startup helper): 0%. Verified by the Docker run.
-- `ExpiredLinkCleanupService`, the timer loop around the cleaner: 35.7%. The cleaning logic itself (`ExpiredLinkCleaner`) is 100% covered; the loop was checked manually.
+**Code coverage** (Visual Studio code coverage over the unit and integration tests, measured after the retry decorator, the metrics and the date response format were added): **78.6% of lines** and **92.6% of blocks**.
 
-Other classes: all analytics classes, controllers, validators, services and the cache decorator are 97.8% to 100% covered. `ShortUrlRepository` is 79% and the exception middleware 82.4%. Coverage was measured once, after all tests passed, with `dotnet test --collect:"XPlat Code Coverage"`.
+- The earlier measurement (coverlet with ReportGenerator, before Entry 11) reported 66.4% of lines. The two figures come from different tools with different exclusion rules, so they are not a like-for-like improvement; the new code and its 38 new tests account for part of the rise.
+- Block coverage is the Visual Studio metric: a block is a run of statements with no branch. It is not the same as branch coverage, which was not measured in this run.
+- The per-class breakdown from the earlier run (for example, generated migrations and the migrate-on-startup helper at 0%, and the cleanup timer loop at 35.7%) was not re-measured, so it is not repeated here. The migrations and the startup helper are verified by applying them to SQL Server through `docker compose up --build`, not by unit tests.
 
 ### Performance results
 
@@ -766,7 +885,7 @@ Environment: everything on one laptop (API, SQL Server and Redis in Docker, load
 
 How to read the results:
 
-- **Run A (1000 in flight):** the 121 failed requests never reached the application (Redis counted exactly the 879 that did). The multi-second latencies are most likely dominated by opening 1000 simultaneous TLS connections on one machine, not by the redirect itself, which is served from cache. The cause of the connection errors was not confirmed; connection queueing on a single host is the likely explanation.
+- **Run A (1000 in flight):** the 121 failed requests never reached the application (Redis counted exactly the 879 that did). The multi-second latencies are most likely dominated by opening 1000 simultaneous TLS connections on one machine, not by the redirect itself, which is served from cache. The cause of the connection errors in the first run was not confirmed; connection queueing on a single host is the likely explanation.
 - **Runs B and C (100 and 250 in flight):** no errors. Throughput stayed at about 250–266 requests/s while median latency rose from 342 ms to 986 ms, so the extra concurrent requests mostly queued. The API, SQL Server, Redis and the load tool all share one laptop, so these figures show the limit of this test setup, not the capacity of the service. Run B is the most representative of the redirect path itself.
 - **What was not measured:** the runs hit the cached redirect path (about 99.9% Redis hits). No separate database load test was run, so the figures say little about SQL Server throughput.
 
@@ -794,6 +913,7 @@ Built-in protections these tests confirm: only `http`/`https` URLs are accepted,
 | Code generation | Base62 of the identity id (+ offset) | GUID, random string, truncated hash | Shortest codes, no collisions, no retry loop | Codes are sequential, so links can be enumerated |
 | Insert flow | Placeholder code, then real code, in one transaction | Separate sequence or a second table | No extra database object | Two writes per create |
 | Duplicate detection | Non-unique index on a SHA-256 of the normalized URL | Index on the URL itself | URLs up to 2048 characters cannot be indexed; non-unique so expired links do not block re-shortening | An extra equality check on the URL after the hash match |
+| Expiry in the response | UTC date (`2027-01-01`), as in the assessment contract | Full timestamp | Matches the specified contract; the service still stores and enforces the exact instant | A client cannot see the time of day; a link shown as expiring on a date can stop working earlier that day |
 | Redirect status | 302 (temporary) | 301 (permanent) | Links can change, expire or be deleted; a 301 would be cached by browsers forever | Browsers do not cache the redirect, so every click reaches the API |
 | Caching | Redis cache-aside decorator | No cache or in-process memory cache | Lower redirect latency; shared across instances | Stale-read window of up to the TTL if an invalidation fails; extra moving part |
 | Cache failure | Fail open with a 30 s circuit breaker | Fail the request | Redirects must work without Redis | One slow request (500 ms) per cooldown when Redis is down |
@@ -806,6 +926,8 @@ Built-in protections these tests confirm: only `http`/`https` URLs are accepted,
 | Expiry cleanup | Hourly batched delete after a 7 day grace period | Delete at expiry, or database-side jobs | Analytics survive for a while and deletes stay small | Click history is deleted with the link; expired rows linger up to a week |
 | Cache vs direct database changes | Invalidate on API writes only | Cache invalidation via database triggers or events | Simple and fast | A manual change in the database can be served stale for up to the TTL (10 minutes) |
 | Reporting | Separate `ReportService`, aggregation in SQL, UTC days, nullable `Browser` column with a heuristic detector | Third-party User-Agent parser, local-time reports, a precomputed rollup table | Redirect path untouched, no new dependency, old rows stay valid | Coarse browser families only; evening clicks in the Americas land on the next UTC day; each report scans the link's click rows in range |
+| Retries | Polly retry decorator on idempotent database operations only, transient SQL errors, exponential backoff with jitter | Retry everything, or use EF Core `EnableRetryOnFailure` | A blind retry of an insert or an optimistic-lock save can duplicate a row or hide a conflict; a custom transaction does not work with EF's execution strategy | Create and update are exposed to transient failures; click batches are not retried as a whole |
+| Metrics | Static prometheus-net counters and gauge, scraped from `/metrics` | OpenTelemetry pipeline, or structured logs only | No I/O on the hot path, no new infrastructure, standard format | Counters are per process; the endpoint is unauthenticated; no dashboards or alerts included |
 | Database | SQL Server | NoSQL | Relational model, transactions, identity keys | Heavier to run locally than a document store |
 
 The decision with the most weight is the Base62-from-id scheme. It makes creation simple and collision-free, which removes a whole class of retry and consistency problems, and the price is guessable codes. For a public service I would add a reversible id scrambler before encoding; I left it out to keep the first version simple and deterministic to test.
@@ -830,6 +952,9 @@ The decision with the most weight is the Base62-from-id scheme. It makes creatio
 - Authentication and authorization are not implemented: anyone can update or delete any link
 - No custom domains or vanity URLs
 - No QR code generation
+- Retries cover reads, reports and deletes only. Creating and updating a link, and the click batch insert, are not retried as a whole
+- `/metrics` is unauthenticated and exposes operational counts: restrict it at the network or ingress level outside local development. No dashboards or alerts are included
+- Metric counters are per process, so with several instances they must be summed by the scraper
 - The default analytics salt and SQL password in `appsettings.json` are for local development only
 
 ---
@@ -841,6 +966,8 @@ The decision with the most weight is the Base62-from-id scheme. It makes creatio
 - **What I would prompt differently next time:** Give the AI the exact project layout, project and namespace names, and shell (Windows cmd) up front, and ask it to list the build and test commands that prove each change.
 - **Biggest time saver:** Generating the schema, persistence and test scaffolding in one pass, so my time went on reviewing decisions rather than typing.
 - **What testing taught me:** unit tests with a mocked repository passed while three environment problems (Docker build, test fixture rules, a stale cache after a manual database edit) only appeared when the real pieces ran together. The integration suite and the Docker run found more than the first 181 tests did.
+- **Check against the assessment early:** reviewing the README against the assessment PDF late found missing referenced files, stale commit references and two unbuilt reliability features. The check is cheap and belongs in Day 1, not Day 3.
+- **Reversing a decision:** in Entry 10 I declined Polly because I could not name a failure mode to protect against. Restricting retries to idempotent operations gave me that failure mode, so I changed my mind and recorded why.
 - **Biggest risk of relying on AI:** Confident-looking code that has never been run. Every change needed a build, a test run and a manual check before I trusted it.
 
 ---
@@ -853,9 +980,14 @@ The decision with the most weight is the Base62-from-id scheme. It makes creatio
 - Id scrambling so short codes are not enumerable
 - Bot filtering for analytics, and GeoIP for country
 - Authentication and per-user link ownership
-- Polly retries on database calls, and JSON log output (Serilog compact formatter) shipped to a log store
+- JSON log output (Serilog compact formatter) shipped to a log store
+- Retries on the click batch insert, and a circuit breaker on the database
 - Deployment stage in the pipeline (the current workflow builds, tests and builds the image, but does not deploy)
-- Metrics and monitoring: a metrics endpoint (OpenTelemetry or Prometheus) for redirect latency, cache hit ratio and queue depth
+- Dashboards and alerts on the existing `/metrics` series (redirect latency, cache hit ratio, queue depth, retries)
 
 ---
+
+
+
+
 

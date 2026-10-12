@@ -1,3 +1,4 @@
+using UrlShortener.Metrics;
 using Microsoft.Extensions.Options;
 using UrlShortener.Configurations;
 using UrlShortener.DTOs;
@@ -49,6 +50,7 @@ public class UrlShortenerService : IUrlShortenerService
         };
 
         var created = await _repository.AddAsync(entity, ShortCodeGenerator.FromId, ct);
+        AppMetrics.LinksCreated.Inc();
         _logger.LogInformation("Created short URL {Code} expiring {ExpiresAt:O}", created.Code, created.ExpiresAt);
 
         return new CreateResult(ToResponse(created), Created: true);

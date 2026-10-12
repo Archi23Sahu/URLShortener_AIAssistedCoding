@@ -1,0 +1,54 @@
+%%{init: {"theme": "neutral", "flowchart": {"curve": "basis", "nodeSpacing": 40, "rankSpacing": 55}}}%%
+flowchart TD
+    Client([Client])
+
+    subgraph PIPE["HTTP pipeline, in order"]
+        direction TB
+        EX["Exception handling middleware<br/>RFC 7807 problem responses"]
+        RL["Rate limiter<br/>fixed window per client IP<br/>write 20/min, read 300/min"]
+        HM["HTTP metrics<br/>prometheus-net"]
+        EX --> RL --> HM
+    end
+
+    Client --> EX
+
+    HM --> SC["ShortenController<br/>POST, PUT, DELETE"]
+    HM --> AC["AnalyticsController<br/>totals, daily, countries, browsers"]
+    HM --> RC["RedirectController<br/>GET /code"]
+
+    SC --> FV["FluentValidation"]
+    SC --> CS
+    AC --> CS
+    RC --> CS
+    AC --> RS["ReportService<br/>UTC days, zero-filled, 366-day cap"]
+
+    CS["CachedUrlShortenerService<br/>cache-aside decorator<br/>circuit breaker"] --> Redis[("Redis")]
+    CS --> US["UrlShortenerService<br/>Base62, normalize, expiry, duplicates"]
+
+    US --> RR
+    RS --> RR
+    CL["ExpiredLinkCleanupService<br/>hourly, 7-day grace, batches of 1000"] --> RR
+
+    RR["ResilientShortUrlRepository<br/>Polly retry on transient SQL errors<br/>idempotent operations only"] --> REPO["ShortUrlRepository<br/>EF Core"]
+    REPO --> DB[("SQL Server")]
+
+    RC --> CT["ClickTracker<br/>no I/O, never throws"]
+    CT --> Q[["Bounded in-memory queue<br/>Channel, 10,000 clicks"]]
+    Q --> CR["ClickRecorderBackgroundService<br/>batches of 100 or every 2 s"]
+    CR --> DB
+
+    subgraph OPS["Not rate limited"]
+        direction TB
+        HEALTH["GET /health<br/>checks the database"]
+        METRICS["GET /metrics<br/>Prometheus format"]
+    end
+    HEALTH --> DB
+
+    AM["AppMetrics<br/>links created, cache hit/miss, queue depth,<br/>clicks stored/dropped, DB retries, links cleaned"]
+    AM --> METRICS
+    HM -.-> AM
+    CS -.-> AM
+    CT -.-> AM
+    CR -.-> AM
+    CL -.-> AM
+    RR -.-> AM

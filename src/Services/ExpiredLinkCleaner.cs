@@ -1,3 +1,4 @@
+using UrlShortener.Metrics;
 using Microsoft.Extensions.Options;
 using UrlShortener.Configurations;
 using UrlShortener.Repositories;
@@ -52,6 +53,7 @@ public sealed class ExpiredLinkCleaner
 
         if (total > 0)
         {
+            AppMetrics.ExpiredLinksDeleted.Inc(total);
             _logger.LogInformation("Cleanup deleted {Count} link(s) that expired before {Cutoff:O}", total, cutoff);
         }
 

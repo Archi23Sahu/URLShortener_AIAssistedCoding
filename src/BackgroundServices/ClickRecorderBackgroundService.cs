@@ -3,6 +3,7 @@ using Microsoft.Extensions.Options;
 using UrlShortener.Analytics;
 using UrlShortener.Configurations;
 using UrlShortener.Entities;
+using UrlShortener.Metrics;
 using UrlShortener.Repositories;
 
 namespace UrlShortener.BackgroundServices;
@@ -133,6 +134,7 @@ public sealed class ClickRecorderBackgroundService : BackgroundService
             Browser = c.Browser
         }));
 
-        await db.SaveChangesAsync(ct);
+        var stored = await db.SaveChangesAsync(ct);
+        AppMetrics.ClicksStored.Inc(stored);
     }
 }

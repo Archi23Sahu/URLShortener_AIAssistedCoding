@@ -127,7 +127,8 @@ public class ApiEndToEndTests : IClassFixture<ApiFactory>
     {
         var (_, body) = await CreateAsync(_client, expiryDays: 2);
 
-        body.ExpiresAt.Should().BeCloseTo(DateTime.UtcNow.AddDays(2), TimeSpan.FromMinutes(5));
+        // The response carries a UTC date only, so compare days, not minutes.
+        body.ExpiresAt.Date.Should().Be(DateTime.UtcNow.AddDays(2).Date);
     }
 
     [Fact]

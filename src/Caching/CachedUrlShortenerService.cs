@@ -3,6 +3,7 @@ using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.Options;
 using UrlShortener.Configurations;
 using UrlShortener.DTOs;
+using UrlShortener.Metrics;
 using UrlShortener.Services;
 
 namespace UrlShortener.Caching;
@@ -47,10 +48,12 @@ public sealed class CachedUrlShortenerService : IUrlShortenerService
         var cached = await TryGetAsync(code, ct);
         if (cached is not null && cached.ExpiresAt > Now())
         {
+            AppMetrics.CacheLookups.WithLabels("hit").Inc();
             _logger.LogDebug("Cache hit for {Code}", code);
             return cached;
         }
 
+        AppMetrics.CacheLookups.WithLabels("miss").Inc();
         _logger.LogDebug("Cache miss for {Code}", code);
 
         // Throws NotFoundException / LinkExpiredException, which are deliberately not cached.

@@ -1,3 +1,4 @@
+using UrlShortener.Metrics;
 using Microsoft.Extensions.Options;
 using UrlShortener.Configurations;
 
@@ -47,8 +48,13 @@ public sealed class ClickTracker
                 _country.Resolve(context),
                 BrowserDetector.Detect(userAgent));
 
-            if (!_queue.TryEnqueue(click))
+            if (_queue.TryEnqueue(click))
             {
+                AppMetrics.ClicksEnqueued.Inc();
+            }
+            else
+            {
+                AppMetrics.ClicksDropped.Inc();
                 _logger.LogWarning("Click queue is full; dropped a click for link {ShortUrlId}", shortUrlId);
             }
         }

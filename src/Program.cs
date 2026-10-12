@@ -11,6 +11,10 @@ using UrlShortener.Repositories;
 using UrlShortener.Services;
 using UrlShortener.Validators;
 using Serilog;
+using Microsoft.Extensions.Options;
+using Polly;
+using Prometheus;
+using UrlShortener.Metrics;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -27,7 +31,15 @@ builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseSqlServer(builder.Configuration.GetConnectionString("Default")));
 
 builder.Services.AddSingleton(TimeProvider.System);
-builder.Services.AddScoped<IShortUrlRepository, ShortUrlRepository>();
+builder.Services.Configure<ResilienceOptions>(builder.Configuration.GetSection(ResilienceOptions.SectionName));
+builder.Services.AddSingleton(sp => ResilientShortUrlRepository.CreatePipeline(
+    sp.GetRequiredService<IOptions<ResilienceOptions>>().Value,
+    sp.GetRequiredService<ILoggerFactory>().CreateLogger<ResilientShortUrlRepository>()));
+// Polly retries (transient SQL errors) wrap the repository; only idempotent operations are retried.
+builder.Services.AddScoped<ShortUrlRepository>();
+builder.Services.AddScoped<IShortUrlRepository>(sp => new ResilientShortUrlRepository(
+    sp.GetRequiredService<ShortUrlRepository>(),
+    sp.GetRequiredService<ResiliencePipeline>()));
 
 // Task 5: Redis cache-aside on the redirect path. CachedUrlShortenerService wraps the real service.
 builder.Services.Configure<CacheOptions>(builder.Configuration.GetSection(CacheOptions.SectionName));
@@ -95,8 +107,14 @@ if (app.Configuration.GetValue<bool>("Database:MigrateOnStartup"))
 // After routing (added automatically) so [EnableRateLimiting] on controllers is visible; before the endpoints run.
 app.UseRateLimiter();
 
+// Metrics: HTTP request counters/latency plus the application metrics in AppMetrics, at /metrics.
+app.UseHttpMetrics();
+var clickQueue = app.Services.GetRequiredService<UrlShortener.Analytics.IClickQueue>();
+Metrics.DefaultRegistry.AddBeforeCollectCallback(() => AppMetrics.ClickQueueDepth.Set(clickQueue.Reader.Count));
+
 app.MapControllers();
 app.MapHealthChecks("/health");
+app.MapMetrics();
 
 app.Run();
 

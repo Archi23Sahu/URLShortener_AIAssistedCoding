@@ -64,6 +64,7 @@ CREATE TABLE dbo.ClickEvents
     ClickedAt   DATETIME2 NOT NULL,        -- UTC
     VisitorHash CHAR(64)  NOT NULL,
     Country     CHAR(2)   NULL,            -- ISO 3166-1 alpha-2
+    Browser     VARCHAR(30) NULL,          -- browser family; NULL for clicks recorded before Scenario 3
     CONSTRAINT PK_ClickEvents PRIMARY KEY CLUSTERED (Id),
     CONSTRAINT FK_ClickEvents_ShortUrls_ShortUrlId
         FOREIGN KEY (ShortUrlId) REFERENCES dbo.ShortUrls (Id) ON DELETE CASCADE
